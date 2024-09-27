@@ -29,7 +29,7 @@ def img_to_arr( img ):
         img = imread_cv2(img)
     return img
 
-def imread_cv2(path, options=cv2.IMREAD_COLOR):
+def imread_cv2(path: str, options=cv2.IMREAD_COLOR) -> np.ndarray:
     """ Open an image or a depthmap with opencv-python.
     """
     if path.endswith(('.exr', 'EXR')):

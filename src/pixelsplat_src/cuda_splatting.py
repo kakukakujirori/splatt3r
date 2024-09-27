@@ -7,20 +7,23 @@ from diff_gaussian_rasterization import (
     GaussianRasterizer,
 )
 from einops import einsum, rearrange, repeat
+from jaxtyping import Float
 from torch import Tensor
 
 from .projection import get_fov, homogenize_points
 
 
 def get_projection_matrix(
-    near,
-    far,
-    fov_x,
-    fov_y,
-):
+    near: Float[Tensor, "b"],  # 1.0
+    far: Float[Tensor, "b"],   # 1000.0
+    fov_x: Float[Tensor, "b"],
+    fov_y: Float[Tensor, "b"],
+) -> Float[Tensor, "b 4 4"]:
     """Maps points in the viewing frustum to (-1, 1) on the X/Y axes and (0, 1) on the Z
     axis. Differs from the OpenGL version in that Z doesn't have range (-1, 1) after
     transformation and that Z is flipped.
+
+    ref. https://shikihuiku.github.io/post/projection_matrix/
     """
     tan_fov_x = (0.5 * fov_x).tan()
     tan_fov_y = (0.5 * fov_y).tan()
@@ -43,16 +46,16 @@ def get_projection_matrix(
 
 
 def render_cuda(
-    extrinsics,
-    intrinsics,
-    near,
-    far,
+    extrinsics: Float[Tensor, "b 4 4"],
+    intrinsics: Float[Tensor, "b 3 3"],
+    near: Float[Tensor, "b"],
+    far: Float[Tensor, "b"],
     image_shape: tuple[int, int],
-    background_color,
-    gaussian_means,
-    gaussian_covariances,
-    gaussian_sh_coefficients,
-    gaussian_opacities,
+    background_color: Float[Tensor, "b 3"],
+    gaussian_means: Float[Tensor, "b points 3"],
+    gaussian_covariances: Float[Tensor, "b points 3 3"],
+    gaussian_sh_coefficients: Float[Tensor, "b points 3 d_sh"],
+    gaussian_opacities: Float[Tensor, "b points"],
     scale_invariant: bool = True,
     use_sh: bool = True,
 ):
@@ -65,7 +68,7 @@ def render_cuda(
         extrinsics[..., :3, 3] = extrinsics[..., :3, 3] * scale[:, None]
         gaussian_covariances = gaussian_covariances * (scale[:, None, None, None] ** 2)
         gaussian_means = gaussian_means * scale[:, None, None]
-        near = near * scale
+        near = near * scale  # = 1
         far = far * scale
 
     _, _, _, n = gaussian_sh_coefficients.shape

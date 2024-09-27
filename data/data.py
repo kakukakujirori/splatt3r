@@ -1,3 +1,4 @@
+from typing import Any
 import random
 
 import numpy as np
@@ -11,7 +12,7 @@ from src.mast3r_src.dust3r.dust3r.utils.misc import invalid_to_zeros
 import src.mast3r_src.dust3r.dust3r.datasets.utils.cropping as cropping
 
 
-def crop_resize_if_necessary(image, depthmap, intrinsics, resolution):
+def crop_resize_if_necessary(image: PIL.Image.Image | np.ndarray, depthmap: np.ndarray, intrinsics: np.ndarray, resolution: tuple[int, int]):
     """Adapted from DUST3R's Co3D dataset implementation"""
 
     if not isinstance(image, PIL.Image.Image):
@@ -44,14 +45,14 @@ def crop_resize_if_necessary(image, depthmap, intrinsics, resolution):
 
 class DUST3RSplattingDataset(torch.utils.data.Dataset):
 
-    def __init__(self, data, coverage, resolution, num_epochs_per_epoch=1, alpha=0.3, beta=0.3):
+    def __init__(self, data, coverage: dict[str, list[list[int]]], resolution: tuple[int, int], num_epochs_per_epoch=1, alpha=0.3, beta=0.3):
 
         super(DUST3RSplattingDataset, self).__init__()
         self.data = data
         self.coverage = coverage
 
-        self.num_context_views = 2
-        self.num_target_views = 3
+        self.num_context_views = 2  # TODO: FIXED NUMBER
+        self.num_target_views = 3   # TODO: FIXED NUMBER
 
         self.resolution = resolution
         self.transform = ImgNorm
@@ -61,28 +62,32 @@ class DUST3RSplattingDataset(torch.utils.data.Dataset):
         self.alpha = alpha
         self.beta = beta
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict[str, Any]:
 
-        sequence = self.data.sequences[idx // self.num_epochs_per_epoch]
+        sequence: str = self.data.sequences[idx // self.num_epochs_per_epoch]
         sequence_length = len(self.data.color_paths[sequence])
 
         context_views, target_views = self.sample(sequence, self.num_target_views, self.alpha, self.beta)
 
-        views = {"context": [], "target": [], "scene": sequence}
+        views = {
+            "context": [],  # tuple[dict[str, Any], dict[str, Any]]
+            "target": [],  # list[dict[str, Any]]
+            "scene": sequence,  # str
+        }
 
         # Fetch the context views
         for c_view in context_views:
 
             assert c_view < sequence_length, f"Invalid view index: {c_view}, sequence length: {sequence_length}, c_views: {context_views}"
 
-            view = self.data.get_view(sequence, c_view, self.resolution)
+            view: dict[str, Any] = self.data.get_view(sequence, c_view, self.resolution)
 
-            # Transform the input
+            # Transform the input (normalize & totensor)
             view['img'] = self.transform(view['original_img'])
             view['original_img'] = self.org_transform(view['original_img'])
 
-            # Create the point cloud and validity mask
-            pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
+            # Create the point cloud (depthmap -> camera coord point cloud -> world coord point cloud) and validity mask
+            pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)  # [h, w, 3], [h, w]
             view['pts3d'] = pts3d
             view['valid_mask'] = valid_mask & np.isfinite(pts3d).all(axis=-1)
             assert view['valid_mask'].any(), f"Invalid mask for sequence: {sequence}, view: {c_view}"
@@ -99,10 +104,9 @@ class DUST3RSplattingDataset(torch.utils.data.Dataset):
         return views
 
     def __len__(self):
-
         return len(self.data.sequences) * self.num_epochs_per_epoch
 
-    def sample(self, sequence, num_target_views, context_overlap_threshold=0.5, target_overlap_threshold=0.6):
+    def sample(self, sequence: str, num_target_views: int, context_overlap_threshold=0.5, target_overlap_threshold=0.6) -> tuple[tuple[int, int], list[int]]:
 
         first_context_view = random.randint(0, len(self.data.color_paths[sequence]) - 1)
 

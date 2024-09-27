@@ -18,9 +18,9 @@ pretrained_mast3r_path: './checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt
 
 # Data
 data:
-  root: '/home/bras5602/data/scannetpp'
-  batch_size: 12
-  num_workers: 16
+  root: /media/ryotaro/ssd1/ScanNet++/data
+  batch_size: 1
+  num_workers: 4
   resolution: [512, 512]
   epochs_per_train_epoch: 100 # How many times to sample from each scene each training epoch (helps avoid unnecessary Pytorch Lightning overhead)
 
@@ -35,7 +35,7 @@ loss:
   mse_loss_weight: 1.0
   lpips_loss_weight: 0.25
   mast3r_loss_weight: Null
-  apply_mask: True
+  apply_mask: False  # True
   average_over_mask: True
 
 use_offsets: True

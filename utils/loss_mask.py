@@ -1,3 +1,5 @@
+from typing import Any
+
 import einops
 import torch
 
@@ -72,7 +74,7 @@ def calculate_in_frustum_mask(depth_1, intrinsics_1, c2w_1, depth_2, intrinsics_
 
 
 @torch.no_grad()
-def calculate_loss_mask(batch):
+def calculate_loss_mask(batch: dict[str, Any]):
     '''Calcuate the loss mask for the target views in the batch'''
 
     target_depth = torch.stack([target_view['depthmap'] for target_view in batch['target']], dim=1)

@@ -14,7 +14,7 @@ class DecoderSplattingCUDA(torch.nn.Module):
             torch.tensor(background_color, dtype=torch.float32),
             persistent=False,
         )
-    
+
     def forward(self, batch, pred1, pred2, image_shape):
 
         base_pose = batch['context'][0]['camera_pose'] # [b, 4, 4]
@@ -33,20 +33,21 @@ class DecoderSplattingCUDA(torch.nn.Module):
         harmonics = torch.stack([pred1["sh"], pred2["sh"]], dim=1)
         opacities = torch.stack([pred1["opacities"], pred2["opacities"]], dim=1)
 
-        b, v, _, _ = extrinsics.shape
+        b, v, _, _ = extrinsics.shape  # batch_size, target_view_num
         near = torch.full((b, v), 0.1, device=means.device)
         far = torch.full((b, v), 1000.0, device=means.device)
 
         color = render_cuda(
-            rearrange(extrinsics, "b v i j -> (b v) i j"),
-            rearrange(intrinsics, "b v i j -> (b v) i j"),
+            rearrange(extrinsics, "b v i j -> (b v) i j", i=4, j=4),
+            rearrange(intrinsics, "b v i j -> (b v) i j", i=3, j=3),
             rearrange(near, "b v -> (b v)"),
             rearrange(far, "b v -> (b v)"),
             image_shape,
-            repeat(self.background_color, "c -> (b v) c", b=b, v=v),
-            repeat(rearrange(means, "b v h w xyz -> b (v h w) xyz"), "b g xyz -> (b v) g xyz", v=v),
-            repeat(rearrange(covariances, "b v h w i j -> b (v h w) i j"), "b g i j -> (b v) g i j", v=v),
-            repeat(rearrange(harmonics, "b v h w c d_sh -> b (v h w) c d_sh"), "b g c d_sh -> (b v) g c d_sh", v=v),
+            repeat(self.background_color, "c -> (b v) c", b=b, v=v, c=3),
+            # Below, the first v is 2, meaning that predicted point clouds are not merged but simply aggregated, and duplicated for each target view
+            repeat(rearrange(means, "b v h w xyz -> b (v h w) xyz", xyz=3), "b g xyz -> (b v) g xyz", v=v),
+            repeat(rearrange(covariances, "b v h w i j -> b (v h w) i j", i=3, j=3), "b g i j -> (b v) g i j", v=v),
+            repeat(rearrange(harmonics, "b v h w c d_sh -> b (v h w) c d_sh", c=3), "b g c d_sh -> (b v) g c d_sh", v=v),
             repeat(rearrange(opacities, "b v h w 1 -> b (v h w)"), "b g -> (b v) g", v=v),
         )
         color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)

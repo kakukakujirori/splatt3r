@@ -1,3 +1,4 @@
+from typing import Any
 import json
 import os
 import sys
@@ -83,7 +84,7 @@ class MAST3RGaussians(L.LightningModule):
 
         self.save_hyperparameters()
 
-    def forward(self, view1, view2):
+    def forward(self, view1:dict[str, Any], view2: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
 
         # Freeze the encoder and decoder
         with torch.no_grad():
@@ -91,8 +92,8 @@ class MAST3RGaussians(L.LightningModule):
             dec1, dec2 = self.encoder._decoder(feat1, pos1, feat2, pos2)
 
         # Train the downstream heads
-        pred1 = self.encoder._downstream_head(1, [tok.float() for tok in dec1], shape1)
-        pred2 = self.encoder._downstream_head(2, [tok.float() for tok in dec2], shape2)
+        pred1: dict[str, Any] = self.encoder._downstream_head(1, [tok.float() for tok in dec1], shape1)
+        pred2: dict[str, Any] = self.encoder._downstream_head(2, [tok.float() for tok in dec2], shape2)
 
         pred1['covariances'] = geometry.build_covariance(pred1['scales'], pred1['rotations'])
         pred2['covariances'] = geometry.build_covariance(pred2['scales'], pred2['rotations'])
@@ -112,8 +113,8 @@ class MAST3RGaussians(L.LightningModule):
 
         return pred1, pred2
 
-    def training_step(self, batch, batch_idx):
-
+    def training_step(self, batch: dict[str, Any], batch_idx: int):
+        # batch = {"context": tuple[dict[str, Any], dict[str, Any]], "target": list[dict[str, Any]], "scene": str}
         _, _, h, w = batch["context"][0]["img"].shape
         view1, view2 = batch['context']
 
@@ -329,19 +330,19 @@ def run_experiment(config):
         num_workers=config.data.num_workers,
     )
 
-    val_dataset = scannetpp.get_scannet_test_dataset(
-        config.data.root,
-        alpha=0.5,
-        beta=0.5,
-        resolution=config.data.resolution,
-        use_every_n_sample=100,
-    )
-    data_loader_val = torch.utils.data.DataLoader(
-        val_dataset,
-        shuffle=False,
-        batch_size=config.data.batch_size,
-        num_workers=config.data.num_workers,
-    )
+    # val_dataset = scannetpp.get_scannet_test_dataset(
+    #     config.data.root,
+    #     alpha=0.5,
+    #     beta=0.5,
+    #     resolution=config.data.resolution,
+    #     use_every_n_sample=100,
+    # )
+    # data_loader_val = torch.utils.data.DataLoader(
+    #     val_dataset,
+    #     shuffle=False,
+    #     batch_size=config.data.batch_size,
+    #     num_workers=config.data.num_workers,
+    # )
 
     # Training
     print('Training')
@@ -362,7 +363,7 @@ def run_experiment(config):
         profiler=profiler,
         strategy="ddp_find_unused_parameters_true" if len(config.devices) > 1 else "auto",
     )
-    trainer.fit(model, train_dataloaders=data_loader_train, val_dataloaders=data_loader_val)
+    trainer.fit(model, train_dataloaders=data_loader_train)#, val_dataloaders=data_loader_val)  ############################################
 
     # Testing
     original_save_dir = config.save_dir

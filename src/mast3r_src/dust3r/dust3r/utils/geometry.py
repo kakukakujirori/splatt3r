@@ -204,7 +204,7 @@ def depthmap_to_absolute_camera_coordinates(depthmap, camera_intrinsics, camera_
         - camera_intrinsics: a 3x3 matrix
         - camera_pose: a 4x3 or 4x4 cam2world matrix
     Returns:
-        pointmap of absolute coordinates (HxWx3 array), and a mask specifying valid pixels."""
+        pointmap of absolute coordinates (HxWx3 array), and a mask specifying valid pixels (this resides in 2D image domain)."""
     X_cam, valid_mask = depthmap_to_camera_coordinates(depthmap, camera_intrinsics)
 
     X_world = X_cam # default

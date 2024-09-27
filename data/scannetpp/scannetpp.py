@@ -1,3 +1,5 @@
+from typing import Any
+
 import json
 import logging
 import os
@@ -30,13 +32,15 @@ class ScanNetPPData():
 
         # Fetch the sequences to use
         if stage == "train":
-            sequence_file = os.path.join(self.root, "raw", "splits", "nvs_sem_train.txt")
+            sequence_file = os.path.join(self.root, "splits", "nvs_sem_train.txt")
             bad_scenes = ['303745abc7']
         elif stage == "val" or stage == "test":
-            sequence_file = os.path.join(self.root, "raw", "splits", "nvs_sem_val.txt")
+            sequence_file = os.path.join(self.root, "splits", "nvs_sem_val.txt")
             bad_scenes = ['cc5237fd77']
         with open(sequence_file, "r") as f:
             self.sequences = f.read().splitlines()
+
+        # print(f"{self.sequences=}")  # = ['56a0ec536c', '8b5caf3398', '41b00feddb', ...]
 
         # Remove scenes that have frames with no valid depths
         logger.info(f"Removing scenes that have frames with no valid depths: {bad_scenes}")
@@ -53,8 +57,17 @@ class ScanNetPPData():
         scenes_with_no_good_frames = []
         for sequence in self.sequences:
 
-            input_raw_folder = os.path.join(self.root, 'raw', 'data', sequence)
-            input_processed_folder = os.path.join(self.root, 'processed', sequence)
+            input_raw_folder = os.path.join(self.root, 'data', sequence)
+            input_processed_folder = os.path.join(self.root, 'data', sequence)
+
+            if not os.path.isdir(input_raw_folder):  #######################################################################
+                print(f"[ScanNetPPData] {input_raw_folder} not found, skipping...")
+                scenes_with_no_good_frames.append(sequence)
+                continue
+            if not os.path.isdir(os.path.join(input_processed_folder, "dslr", "undistorted_depths")):  #################################################
+                print(f"[ScanNetPPData] {input_processed_folder} doesn't have undistorted_depths, skipping...")
+                scenes_with_no_good_frames.append(sequence)
+                continue
 
             # Load Train & Test Splits
             frame_file = os.path.join(input_raw_folder, "dslr", "train_test_lists.json")
@@ -115,7 +128,7 @@ class ScanNetPPData():
         # Remove scenes with no good frames
         self.sequences = [s for s in self.sequences if s not in scenes_with_no_good_frames]
 
-    def get_view(self, sequence, view_idx, resolution):
+    def get_view(self, sequence: str, view_idx: int, resolution: tuple[int, int]) -> dict[str, Any]:
 
         # RGB Image
         rgb_path = self.color_paths[sequence][view_idx]
@@ -133,7 +146,7 @@ class ScanNetPPData():
         # Camera Intrinsics
         intrinsics = self.intrinsics[sequence]
 
-        # Resize
+        # Resize (DUSt3R implements crop and resize all their own!!!)
         rgb_image, depthmap, intrinsics = crop_resize_if_necessary(
             rgb_image, depthmap, intrinsics, resolution
         )
@@ -152,15 +165,17 @@ class ScanNetPPData():
         return view
 
 
-def get_scannet_dataset(root, stage, resolution, num_epochs_per_epoch=1):
+def get_scannet_dataset(root: str, stage: str, resolution: tuple[int, int], num_epochs_per_epoch: int = 1):
 
     data = ScanNetPPData(root, stage)
 
     coverage = {}
     for sequence in data.sequences:
-        with open(f'./data/scannetpp/coverage/{sequence}.json', 'r') as f:
-            sequence_coverage = json.load(f)
-        coverage[sequence] = sequence_coverage[sequence]
+        # with open(f'./data/scannetpp/coverage/{sequence}.json', 'r') as f:   ###############################################################
+        #     sequence_coverage = json.load(f)                                 ###############################################################
+        sequence_coverage = [[1.0] * len(data.color_paths[sequence]) for _ in data.color_paths[sequence]]
+        # coverage[sequence] = sequence_coverage[sequence]
+        coverage[sequence] = sequence_coverage
 
     dataset = DUST3RSplattingDataset(
         data,

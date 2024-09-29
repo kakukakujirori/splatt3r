@@ -30,11 +30,6 @@ import utils.loss_mask as loss_mask
 import utils.sh_utils as sh_utils
 import workspace
 
-from src.pixelsplat_src.cuda_splatting import get_fov, get_projection_matrix
-from diff_gaussian_rasterization import (
-    GaussianRasterizationSettings,
-    GaussianRasterizer,
-)
 
 def render_cuda(
     extrinsics: Float[torch.Tensor, "b 4 4"],
@@ -46,7 +41,6 @@ def render_cuda(
     gaussian_means: Float[torch.Tensor, "b points 3"],
     gaussian_quats: Float[torch.Tensor, "b points 4"],
     gaussian_scale: Float[torch.Tensor, "b points 3"],
-    gaussian_covariances: Float[torch.Tensor, "b points 3 3"],
     gaussian_sh_coefficients: Float[torch.Tensor, "b points 3 d_sh"],
     gaussian_opacities: Float[torch.Tensor, "b points"],
     scale_invariant: bool = True,
@@ -59,7 +53,6 @@ def render_cuda(
         scale = 1 / near
         extrinsics = extrinsics.clone()
         extrinsics[..., :3, 3] = extrinsics[..., :3, 3] * scale[:, None]
-        gaussian_covariances = gaussian_covariances * (scale[:, None, None, None] ** 2)
         gaussian_means = gaussian_means * scale[:, None, None]
         gaussian_quats = gaussian_quats * 1  # no effect
         gaussian_scale = gaussian_scale * scale[:, None, None]
@@ -83,54 +76,26 @@ def render_cuda(
     # print(f"{gaussian_sh_coefficients.shape=}")
     # print(f"{gaussian_opacities.shape=}")
 
-    fov_x, fov_y = get_fov(intrinsics).unbind(dim=-1)
-    tan_fov_x = (0.5 * fov_x).tan()
-    tan_fov_y = (0.5 * fov_y).tan()
-
-    projection_matrix = get_projection_matrix(near, far, fov_x, fov_y)
-    projection_matrix = rearrange(projection_matrix, "b i j -> b j i")
-    view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
-    full_projection = view_matrix @ projection_matrix
-
     all_images = []
     for i in range(b):
-        # Set up a tensor for the gradients of the screen-space means.
-        mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
-        try:
-            mean_gradients.retain_grad()
-        except Exception:
-            pass
-
-        settings = GaussianRasterizationSettings(
-            image_height=h,
-            image_width=w,
-            tanfovx=tan_fov_x[i].item(),
-            tanfovy=tan_fov_y[i].item(),
-            bg=background_color[i],
-            scale_modifier=1.0,
-            viewmatrix=view_matrix[i],
-            projmatrix=full_projection[i],
+        image, _, _ = rasterization_inria_wrapper(
+            means=gaussian_means[i],  # [N, 3]
+            quats=torch.roll(gaussian_quats[i], 1, dims=-1),  # xyzr(PixelSplat) -> rxyz(gsplat)  # [N, 4]
+            scales=gaussian_scale[i],  # [N, 3]
+            opacities=gaussian_opacities[i],  # [N]
+            colors=shs[i],  # [N, (sh_deg + 1)^2, 3]
+            viewmats=extrinsics[i].reshape(1, 4, 4).inverse(),  # [C, 4, 4]
+            Ks=intrinsics[i].reshape(1, 3, 3),  # [C, 3, 3]
+            width=w,
+            height=h,
+            near_plane=near[i],
+            far_plane=far[i],
+            eps2d=0.3,  # FIXED
             sh_degree=degree,
-            campos=extrinsics[i, :3, 3],
-            prefiltered=False,  # This matches the original usage.
-            debug=False,
-        )
-        rasterizer = GaussianRasterizer(settings)
-
-        row, col = torch.triu_indices(3, 3)
-
-        image, radii = rasterizer(
-            means3D=gaussian_means[i],
-            means2D=mean_gradients,
-            shs=shs[i] if use_sh else None,
-            colors_precomp=None if use_sh else shs[i, :, 0, :],
-            opacities=gaussian_opacities[i, ..., None],
-            # scales=gaussian_scale[i],
-            # rotations=torch.roll(gaussian_quats[i], -1, dims=-1),  # xyzr(PixelSplat) -> rxyz(gsplat)
-            cov3D_precomp=gaussian_covariances[i, :, row, col],
-        )
+            backgrounds=background_color[i],
+        )  # image.shape = [1, h, w, 3]
         all_images.append(image)
-    return torch.stack(all_images)
+    return torch.concat(all_images)
 
 
 class GSplatDecoder(torch.nn.Module):
@@ -155,7 +120,8 @@ class GSplatDecoder(torch.nn.Module):
 
         extrinsics = torch.stack([target_view['camera_pose'] for target_view in batch['target']], dim=1)
         intrinsics = torch.stack([target_view['camera_intrinsics'] for target_view in batch['target']], dim=1)
-        intrinsics = geometry.normalize_intrinsics(intrinsics, image_shape)[..., :3, :3]
+        # intrinsics = geometry.normalize_intrinsics(intrinsics, image_shape)
+        intrinsics = intrinsics[..., :3, :3]
 
         # Rotate the ground truth extrinsics into the coordinate system used by MAST3R
         # --i.e. in the coordinate system of the first context view, normalized by the scene scale
@@ -164,7 +130,7 @@ class GSplatDecoder(torch.nn.Module):
         means = torch.stack([pred1["means"], pred2["means_in_other_view"]], dim=1)
         quats = torch.stack([pred1["rotations"], pred2["rotations"]], dim=1)
         scales = torch.stack([pred1["scales"], pred2["scales"]], dim=1)
-        covariances = torch.stack([pred1["covariances"], pred2["covariances"]], dim=1)
+        # covariances = torch.stack([pred1["covariances"], pred2["covariances"]], dim=1)
         harmonics = torch.stack([pred1["sh"], pred2["sh"]], dim=1)
         opacities = torch.stack([pred1["opacities"], pred2["opacities"]], dim=1)
 
@@ -183,7 +149,6 @@ class GSplatDecoder(torch.nn.Module):
             gaussian_means=repeat(rearrange(means, "b vs h w xyz -> b (vs h w) xyz", xyz=3), "b g xyz -> (b vt) g xyz", vt=vt),
             gaussian_quats=repeat(rearrange(quats, "b vs h w xyzw -> b (vs h w) xyzw", xyzw=4), "b g xyzw -> (b vt) g xyzw", vt=vt),
             gaussian_scale=repeat(rearrange(scales, "b vs h w xyz -> b (vs h w) xyz", xyz=3), "b g xyz -> (b vt) g xyz", vt=vt),
-            gaussian_covariances=repeat(rearrange(covariances, "b vs h w i j -> b (vs h w) i j", i=3, j=3), "b g i j -> (b vt) g i j", vt=vt),
             gaussian_sh_coefficients=repeat(rearrange(harmonics, "b vs h w c d_sh -> b (vs h w) c d_sh", c=3), "b g c d_sh -> (b vt) g c d_sh", vt=vt),
             gaussian_opacities=repeat(rearrange(opacities, "b vs h w 1 -> b (vs h w)"), "b g -> (b vt) g", vt=vt),
         )
@@ -256,8 +221,8 @@ class MAST3RGaussians(L.LightningModule):
         pred1: dict[str, Any] = self.encoder._downstream_head(1, [tok.float() for tok in dec1], shape1)
         pred2: dict[str, Any] = self.encoder._downstream_head(2, [tok.float() for tok in dec2], shape2)
 
-        pred1['covariances'] = geometry.build_covariance(pred1['scales'], pred1['rotations'])
-        pred2['covariances'] = geometry.build_covariance(pred2['scales'], pred2['rotations'])
+        # pred1['covariances'] = geometry.build_covariance(pred1['scales'], pred1['rotations'])
+        # pred2['covariances'] = geometry.build_covariance(pred2['scales'], pred2['rotations'])
 
         learn_residual = True
         if learn_residual:

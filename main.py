@@ -125,6 +125,8 @@ def render_cuda(
             shs=shs[i] if use_sh else None,
             colors_precomp=None if use_sh else shs[i, :, 0, :],
             opacities=gaussian_opacities[i, ..., None],
+            # scales=gaussian_scale[i],
+            # rotations=torch.roll(gaussian_quats[i], -1, dims=-1),  # xyzr(PixelSplat) -> rxyz(gsplat)
             cov3D_precomp=gaussian_covariances[i, :, row, col],
         )
         all_images.append(image)

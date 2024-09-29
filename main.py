@@ -10,7 +10,7 @@ import omegaconf
 import torch
 import wandb
 
-from einops import rearrange, repeat
+from einops import rearrange
 from gsplat.rendering import rasterization, rasterization_inria_wrapper
 from jaxtyping import Float
 
@@ -29,73 +29,6 @@ import utils.geometry as geometry
 import utils.loss_mask as loss_mask
 import utils.sh_utils as sh_utils
 import workspace
-
-
-def render_cuda(
-    extrinsics: Float[torch.Tensor, "b 4 4"],
-    intrinsics: Float[torch.Tensor, "b 3 3"],
-    near: Float[torch.Tensor, "b"],
-    far: Float[torch.Tensor, "b"],
-    image_shape: tuple[int, int],
-    background_color: Float[torch.Tensor, "b 3"],
-    gaussian_means: Float[torch.Tensor, "b points 3"],
-    gaussian_quats: Float[torch.Tensor, "b points 4"],
-    gaussian_scale: Float[torch.Tensor, "b points 3"],
-    gaussian_sh_coefficients: Float[torch.Tensor, "b points 3 d_sh"],
-    gaussian_opacities: Float[torch.Tensor, "b points"],
-    scale_invariant: bool = True,
-    use_sh: bool = True,
-):
-    assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
-
-    # Make sure everything is in a range where numerical issues don't appear.
-    if scale_invariant:
-        scale = 1 / near
-        extrinsics = extrinsics.clone()
-        extrinsics[..., :3, 3] = extrinsics[..., :3, 3] * scale[:, None]
-        gaussian_means = gaussian_means * scale[:, None, None]
-        gaussian_quats = gaussian_quats * 1  # no effect
-        gaussian_scale = gaussian_scale * scale[:, None, None]
-        near = near * scale  # = 1
-        far = far * scale
-
-    _, _, _, n = gaussian_sh_coefficients.shape
-    degree = math.isqrt(n) - 1
-    shs = rearrange(gaussian_sh_coefficients, "b g xyz n -> b g n xyz").contiguous()
-
-    b, _, _ = extrinsics.shape
-    h, w = image_shape
-
-    # print(f"{extrinsics.shape=}")
-    # print(f"{intrinsics.shape=}")
-    # print(f"{near.shape=}")
-    # print(f"{far.shape=}")
-    # print(f"{gaussian_means.shape=}")
-    # print(f"{gaussian_quats.shape=}")
-    # print(f"{gaussian_scale.shape=}")
-    # print(f"{gaussian_sh_coefficients.shape=}")
-    # print(f"{gaussian_opacities.shape=}")
-
-    all_images = []
-    for i in range(b):
-        image, _, _ = rasterization_inria_wrapper(
-            means=gaussian_means[i],  # [N, 3]
-            quats=torch.roll(gaussian_quats[i], 1, dims=-1),  # xyzr(PixelSplat) -> rxyz(gsplat)  # [N, 4]
-            scales=gaussian_scale[i],  # [N, 3]
-            opacities=gaussian_opacities[i],  # [N]
-            colors=shs[i],  # [N, (sh_deg + 1)^2, 3]
-            viewmats=extrinsics[i].reshape(1, 4, 4).inverse(),  # [C, 4, 4]
-            Ks=intrinsics[i].reshape(1, 3, 3),  # [C, 3, 3]
-            width=w,
-            height=h,
-            near_plane=near[i],
-            far_plane=far[i],
-            eps2d=0.3,  # FIXED
-            sh_degree=degree,
-            backgrounds=background_color[i],
-        )  # image.shape = [1, h, w, 3]
-        all_images.append(image)
-    return torch.concat(all_images)
 
 
 class GSplatDecoder(torch.nn.Module):
@@ -120,41 +53,49 @@ class GSplatDecoder(torch.nn.Module):
 
         extrinsics = torch.stack([target_view['camera_pose'] for target_view in batch['target']], dim=1)
         intrinsics = torch.stack([target_view['camera_intrinsics'] for target_view in batch['target']], dim=1)
-        # intrinsics = geometry.normalize_intrinsics(intrinsics, image_shape)
         intrinsics = intrinsics[..., :3, :3]
 
         # Rotate the ground truth extrinsics into the coordinate system used by MAST3R
         # --i.e. in the coordinate system of the first context view, normalized by the scene scale
         extrinsics = inv_base_pose[:, None, :, :] @ extrinsics
+        viewmats = extrinsics.inverse()
 
         means = torch.stack([pred1["means"], pred2["means_in_other_view"]], dim=1)
         quats = torch.stack([pred1["rotations"], pred2["rotations"]], dim=1)
         scales = torch.stack([pred1["scales"], pred2["scales"]], dim=1)
-        # covariances = torch.stack([pred1["covariances"], pred2["covariances"]], dim=1)
         harmonics = torch.stack([pred1["sh"], pred2["sh"]], dim=1)
         opacities = torch.stack([pred1["opacities"], pred2["opacities"]], dim=1)
 
-        b, vt, _, _ = extrinsics.shape  # batch_size(=1), target_view_num(=3)
-        near = torch.full((b, vt), 0.1, device=means.device)
-        far = torch.full((b, vt), 1000.0, device=means.device)
+        # reformat tensors so that they align with gsplat
+        b, vt, _, _ = extrinsics.shape  # batch_size, target_view_num(=3)
+        h, w = image_shape
+        means = rearrange(means, "b g h w xyz -> b (g h w) xyz", g=2, h=h, w=w, xyz=3)
+        quats = rearrange(quats, "b g h w xyzr -> b (g h w) xyzr", g=2, h=h, w=w, xyzr=4)
+        quats = torch.roll(quats, 1, dims=-1)  # xyzr(PixelSplat) -> rxyz(gsplat)
+        scales = rearrange(scales, "b g h w xyz -> b (g h w) xyz", g=2, h=h, w=w, xyz=3)
+        harmonics = rearrange(harmonics, "b g h w rgb n -> b (g h w) n rgb", g=2, h=h, w=w, rgb=3)
+        opacities = rearrange(opacities, "b g h w () -> b (g h w)", g=2, h=h, w=w)
 
-        color = render_cuda(
-            rearrange(extrinsics, "b vt i j -> (b vt) i j", i=4, j=4),
-            rearrange(intrinsics, "b vt i j -> (b vt) i j", i=3, j=3),
-            rearrange(near, "b vt -> (b vt)"),
-            rearrange(far, "b vt -> (b vt)"),
-            image_shape,
-            repeat(self.background_color, "c -> (b vt) c", b=b, vt=vt, c=3),
-            # Below, vs is 2, meaning that predicted point clouds are not merged but simply aggregated, and duplicated for each target view, i.e. vt=3
-            gaussian_means=repeat(rearrange(means, "b vs h w xyz -> b (vs h w) xyz", xyz=3), "b g xyz -> (b vt) g xyz", vt=vt),
-            gaussian_quats=repeat(rearrange(quats, "b vs h w xyzw -> b (vs h w) xyzw", xyzw=4), "b g xyzw -> (b vt) g xyzw", vt=vt),
-            gaussian_scale=repeat(rearrange(scales, "b vs h w xyz -> b (vs h w) xyz", xyz=3), "b g xyz -> (b vt) g xyz", vt=vt),
-            gaussian_sh_coefficients=repeat(rearrange(harmonics, "b vs h w c d_sh -> b (vs h w) c d_sh", c=3), "b g c d_sh -> (b vt) g c d_sh", vt=vt),
-            gaussian_opacities=repeat(rearrange(opacities, "b vs h w 1 -> b (vs h w)"), "b g -> (b vt) g", vt=vt),
-        )
-        # print(f"{color.shape=}")
-        color = rearrange(color, "(b vt) c h w -> b vt c h w", b=b, vt=vt)
-        return color
+        color_batch = []
+        for i in range(b):
+            image, _, _ = rasterization(
+                means=means[i],  # [N, 3]
+                quats=quats[i],  # [N, 4]
+                scales=scales[i],  # [N, 3]
+                opacities=opacities[i],  # [N]
+                colors=harmonics[i],  # [N, (sh_deg + 1)^2, 3]
+                viewmats=viewmats[i],  # [vt, 4, 4]
+                Ks=intrinsics[i],  # [vt, 3, 3]
+                width=w,
+                height=h,
+                near_plane=0.1,
+                far_plane=1000.0,
+                sh_degree=math.isqrt(harmonics.shape[-1]) - 1,
+                backgrounds=self.background_color.expand(vt, 3),  # [vt, RGB]
+            )  # image.shape = [vt, h, w, 3]
+            color_batch.append(image)
+
+        return torch.stack(color_batch)
 
 
 class MAST3RGaussians(L.LightningModule):

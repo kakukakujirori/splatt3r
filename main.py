@@ -1,14 +1,18 @@
 from typing import Any
 import json
+import math
 import os
 import sys
 
-import einops
 import lightning as L
 import lpips
 import omegaconf
 import torch
 import wandb
+
+from einops import rearrange, repeat
+from gsplat.rendering import rasterization, rasterization_inria_wrapper
+from jaxtyping import Float
 
 # Add MAST3R and PixelSplat to the sys.path to prevent issues during importing
 sys.path.append('src/pixelsplat_src')
@@ -19,13 +23,171 @@ from src.mast3r_src.mast3r.losses import ConfLoss, Regr3D
 import data.scannetpp.scannetpp as scannetpp
 import src.mast3r_src.mast3r.model as mast3r_model
 import src.pixelsplat_src.benchmarker as benchmarker
-import src.pixelsplat_src.decoder_splatting_cuda as pixelsplat_decoder
 import utils.compute_ssim as compute_ssim
 import utils.export as export
 import utils.geometry as geometry
 import utils.loss_mask as loss_mask
 import utils.sh_utils as sh_utils
 import workspace
+
+from src.pixelsplat_src.cuda_splatting import get_fov, get_projection_matrix
+from diff_gaussian_rasterization import (
+    GaussianRasterizationSettings,
+    GaussianRasterizer,
+)
+
+def render_cuda(
+    extrinsics: Float[torch.Tensor, "b 4 4"],
+    intrinsics: Float[torch.Tensor, "b 3 3"],
+    near: Float[torch.Tensor, "b"],
+    far: Float[torch.Tensor, "b"],
+    image_shape: tuple[int, int],
+    background_color: Float[torch.Tensor, "b 3"],
+    gaussian_means: Float[torch.Tensor, "b points 3"],
+    gaussian_quats: Float[torch.Tensor, "b points 4"],
+    gaussian_scale: Float[torch.Tensor, "b points 3"],
+    gaussian_covariances: Float[torch.Tensor, "b points 3 3"],
+    gaussian_sh_coefficients: Float[torch.Tensor, "b points 3 d_sh"],
+    gaussian_opacities: Float[torch.Tensor, "b points"],
+    scale_invariant: bool = True,
+    use_sh: bool = True,
+):
+    assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
+
+    # Make sure everything is in a range where numerical issues don't appear.
+    if scale_invariant:
+        scale = 1 / near
+        extrinsics = extrinsics.clone()
+        extrinsics[..., :3, 3] = extrinsics[..., :3, 3] * scale[:, None]
+        gaussian_covariances = gaussian_covariances * (scale[:, None, None, None] ** 2)
+        gaussian_means = gaussian_means * scale[:, None, None]
+        gaussian_quats = gaussian_quats * 1  # no effect
+        gaussian_scale = gaussian_scale * scale[:, None, None]
+        near = near * scale  # = 1
+        far = far * scale
+
+    _, _, _, n = gaussian_sh_coefficients.shape
+    degree = math.isqrt(n) - 1
+    shs = rearrange(gaussian_sh_coefficients, "b g xyz n -> b g n xyz").contiguous()
+
+    b, _, _ = extrinsics.shape
+    h, w = image_shape
+
+    # print(f"{extrinsics.shape=}")
+    # print(f"{intrinsics.shape=}")
+    # print(f"{near.shape=}")
+    # print(f"{far.shape=}")
+    # print(f"{gaussian_means.shape=}")
+    # print(f"{gaussian_quats.shape=}")
+    # print(f"{gaussian_scale.shape=}")
+    # print(f"{gaussian_sh_coefficients.shape=}")
+    # print(f"{gaussian_opacities.shape=}")
+
+    fov_x, fov_y = get_fov(intrinsics).unbind(dim=-1)
+    tan_fov_x = (0.5 * fov_x).tan()
+    tan_fov_y = (0.5 * fov_y).tan()
+
+    projection_matrix = get_projection_matrix(near, far, fov_x, fov_y)
+    projection_matrix = rearrange(projection_matrix, "b i j -> b j i")
+    view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
+    full_projection = view_matrix @ projection_matrix
+
+    all_images = []
+    for i in range(b):
+        # Set up a tensor for the gradients of the screen-space means.
+        mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
+        try:
+            mean_gradients.retain_grad()
+        except Exception:
+            pass
+
+        settings = GaussianRasterizationSettings(
+            image_height=h,
+            image_width=w,
+            tanfovx=tan_fov_x[i].item(),
+            tanfovy=tan_fov_y[i].item(),
+            bg=background_color[i],
+            scale_modifier=1.0,
+            viewmatrix=view_matrix[i],
+            projmatrix=full_projection[i],
+            sh_degree=degree,
+            campos=extrinsics[i, :3, 3],
+            prefiltered=False,  # This matches the original usage.
+            debug=False,
+        )
+        rasterizer = GaussianRasterizer(settings)
+
+        row, col = torch.triu_indices(3, 3)
+
+        image, radii = rasterizer(
+            means3D=gaussian_means[i],
+            means2D=mean_gradients,
+            shs=shs[i] if use_sh else None,
+            colors_precomp=None if use_sh else shs[i, :, 0, :],
+            opacities=gaussian_opacities[i, ..., None],
+            cov3D_precomp=gaussian_covariances[i, :, row, col],
+        )
+        all_images.append(image)
+    return torch.stack(all_images)
+
+
+class GSplatDecoder(torch.nn.Module):
+    def __init__(self, background_color=(0.0, 0.0, 0.0)):
+        super().__init__()
+        self.register_buffer(
+            "background_color",
+            torch.tensor(background_color, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def forward(
+            self,
+            batch: dict[str, Any],
+            pred1: dict[str, torch.Tensor],
+            pred2: dict[str, torch.Tensor],
+            image_shape: tuple[int, int],  # (height, width)
+        ) -> torch.Tensor:
+
+        base_pose = batch['context'][0]['camera_pose'] # [b, 4, 4]
+        inv_base_pose = torch.inverse(base_pose)
+
+        extrinsics = torch.stack([target_view['camera_pose'] for target_view in batch['target']], dim=1)
+        intrinsics = torch.stack([target_view['camera_intrinsics'] for target_view in batch['target']], dim=1)
+        intrinsics = geometry.normalize_intrinsics(intrinsics, image_shape)[..., :3, :3]
+
+        # Rotate the ground truth extrinsics into the coordinate system used by MAST3R
+        # --i.e. in the coordinate system of the first context view, normalized by the scene scale
+        extrinsics = inv_base_pose[:, None, :, :] @ extrinsics
+
+        means = torch.stack([pred1["means"], pred2["means_in_other_view"]], dim=1)
+        quats = torch.stack([pred1["rotations"], pred2["rotations"]], dim=1)
+        scales = torch.stack([pred1["scales"], pred2["scales"]], dim=1)
+        covariances = torch.stack([pred1["covariances"], pred2["covariances"]], dim=1)
+        harmonics = torch.stack([pred1["sh"], pred2["sh"]], dim=1)
+        opacities = torch.stack([pred1["opacities"], pred2["opacities"]], dim=1)
+
+        b, vt, _, _ = extrinsics.shape  # batch_size(=1), target_view_num(=3)
+        near = torch.full((b, vt), 0.1, device=means.device)
+        far = torch.full((b, vt), 1000.0, device=means.device)
+
+        color = render_cuda(
+            rearrange(extrinsics, "b vt i j -> (b vt) i j", i=4, j=4),
+            rearrange(intrinsics, "b vt i j -> (b vt) i j", i=3, j=3),
+            rearrange(near, "b vt -> (b vt)"),
+            rearrange(far, "b vt -> (b vt)"),
+            image_shape,
+            repeat(self.background_color, "c -> (b vt) c", b=b, vt=vt, c=3),
+            # Below, vs is 2, meaning that predicted point clouds are not merged but simply aggregated, and duplicated for each target view, i.e. vt=3
+            gaussian_means=repeat(rearrange(means, "b vs h w xyz -> b (vs h w) xyz", xyz=3), "b g xyz -> (b vt) g xyz", vt=vt),
+            gaussian_quats=repeat(rearrange(quats, "b vs h w xyzw -> b (vs h w) xyzw", xyzw=4), "b g xyzw -> (b vt) g xyzw", vt=vt),
+            gaussian_scale=repeat(rearrange(scales, "b vs h w xyz -> b (vs h w) xyz", xyz=3), "b g xyz -> (b vt) g xyz", vt=vt),
+            gaussian_covariances=repeat(rearrange(covariances, "b vs h w i j -> b (vs h w) i j", i=3, j=3), "b g i j -> (b vt) g i j", vt=vt),
+            gaussian_sh_coefficients=repeat(rearrange(harmonics, "b vs h w c d_sh -> b (vs h w) c d_sh", c=3), "b g c d_sh -> (b vt) g c d_sh", vt=vt),
+            gaussian_opacities=repeat(rearrange(opacities, "b vs h w 1 -> b (vs h w)"), "b g -> (b vt) g", vt=vt),
+        )
+        # print(f"{color.shape=}")
+        color = rearrange(color, "(b vt) c h w -> b vt c h w", b=b, vt=vt)
+        return color
 
 
 class MAST3RGaussians(L.LightningModule):
@@ -64,10 +226,7 @@ class MAST3RGaussians(L.LightningModule):
         self.encoder.downstream_head2.gaussian_dpt.dpt.requires_grad_(True)
 
         # The decoder which we use to render the predicted Gaussians into
-        # images, lightly modified from PixelSplat
-        self.decoder = pixelsplat_decoder.DecoderSplattingCUDA(
-            background_color=[0.0, 0.0, 0.0]
-        )
+        self.decoder = GSplatDecoder(background_color=[0.0, 0.0, 0.0])
 
         self.benchmarker = benchmarker.Benchmarker()
 
@@ -102,8 +261,8 @@ class MAST3RGaussians(L.LightningModule):
         if learn_residual:
             new_sh1 = torch.zeros_like(pred1['sh'])
             new_sh2 = torch.zeros_like(pred2['sh'])
-            new_sh1[..., 0] = sh_utils.RGB2SH(einops.rearrange(view1['original_img'], 'b c h w -> b h w c'))
-            new_sh2[..., 0] = sh_utils.RGB2SH(einops.rearrange(view2['original_img'], 'b c h w -> b h w c'))
+            new_sh1[..., 0] = sh_utils.RGB2SH(rearrange(view1['original_img'], 'b c h w -> b h w c'))
+            new_sh2[..., 0] = sh_utils.RGB2SH(rearrange(view2['original_img'], 'b c h w -> b h w c'))
             pred1['sh'] = pred1['sh'] + new_sh1
             pred2['sh'] = pred2['sh'] + new_sh2
 
@@ -120,7 +279,7 @@ class MAST3RGaussians(L.LightningModule):
 
         # Predict using the encoder/decoder and calculate the loss
         pred1, pred2 = self.forward(view1, view2)
-        color, _ = self.decoder(batch, pred1, pred2, (h, w))
+        color = self.decoder(batch, pred1, pred2, (h, w))
 
         # Calculate losses
         mask = loss_mask.calculate_loss_mask(batch)
@@ -142,7 +301,7 @@ class MAST3RGaussians(L.LightningModule):
 
         # Predict using the encoder/decoder and calculate the loss
         pred1, pred2 = self.forward(view1, view2)
-        color, _ = self.decoder(batch, pred1, pred2, (h, w))
+        color = self.decoder(batch, pred1, pred2, (h, w))
 
         # Calculate losses
         mask = loss_mask.calculate_loss_mask(batch)
@@ -167,7 +326,7 @@ class MAST3RGaussians(L.LightningModule):
         with self.benchmarker.time("encoder"):
             pred1, pred2 = self.forward(view1, view2)
         with self.benchmarker.time("decoder", num_calls=num_targets):
-            color, _ = self.decoder(batch, pred1, pred2, (h, w))
+            color = self.decoder(batch, pred1, pred2, (h, w))
 
         # Calculate losses
         mask = loss_mask.calculate_loss_mask(batch)
@@ -196,9 +355,9 @@ class MAST3RGaussians(L.LightningModule):
             target_color = target_color * mask[..., None, :, :]
             predicted_color = predicted_color * mask[..., None, :, :]
 
-        flattened_color = einops.rearrange(predicted_color, 'b v c h w -> (b v) c h w')
-        flattened_target_color = einops.rearrange(target_color, 'b v c h w -> (b v) c h w')
-        flattened_mask = einops.rearrange(mask, 'b v h w -> (b v) h w')
+        flattened_color = rearrange(predicted_color, 'b v c h w -> (b v) c h w')
+        flattened_target_color = rearrange(target_color, 'b v c h w -> (b v) c h w')
+        flattened_mask = rearrange(mask, 'b v h w -> (b v) h w')
 
         # MSE loss
         rgb_l2_loss = (predicted_color - target_color) ** 2

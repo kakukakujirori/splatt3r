@@ -51,4 +51,4 @@ class DecoderSplattingCUDA(torch.nn.Module):
             repeat(rearrange(opacities, "b v h w 1 -> b (v h w)"), "b g -> (b v) g", v=v),
         )
         color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
-        return color, None
+        return color
